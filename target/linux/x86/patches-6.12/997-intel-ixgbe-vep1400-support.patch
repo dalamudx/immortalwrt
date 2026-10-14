@@ -1,0 +1,411 @@
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -28,6 +28,7 @@
+ #include <linux/bpf_trace.h>
+ #include <linux/atomic.h>
+ #include <linux/numa.h>
++#include <linux/dmi.h>
+ #include <generated/utsrelease.h>
+ #include <scsi/fc/fc_fcoe.h>
+ #include <net/udp_tunnel.h>
+@@ -74,6 +75,25 @@ static const struct ixgbe_info *ixgbe_in
+ 	[board_x550em_a_fw]	= &ixgbe_x550em_a_fw_info,
+ };
+ 
++/* Dell EMC VEP1400 family (sold as SD-WAN EDGE6x0): X553 KR_L ports are
++ * either 2.5G SerDes uplinks to a Marvell 88E6190 switch or 1G SFP cages.
++ */
++static const struct dmi_system_id ixgbe_vep1400_dmi_table[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "EDGE6"),
++		},
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Dell"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "VEP14"),
++		},
++	},
++	{}
++};
++
+ /* ixgbe_pci_tbl - PCI Device ID Table
+  *
+  * Wildcard entries (PCI_ANY_ID) should come last
+@@ -6340,6 +6360,8 @@ static int ixgbe_sw_init(struct ixgbe_ad
+ 	hw->revision_id = pdev->revision;
+ 	hw->subsystem_vendor_id = pdev->subsystem_vendor;
+ 	hw->subsystem_device_id = pdev->subsystem_device;
++	hw->vep1400 = hw->device_id == IXGBE_DEV_ID_X550EM_A_KR_L &&
++		      dmi_check_system(ixgbe_vep1400_dmi_table);
+ 
+ 	/* get_invariants needs the device IDs */
+ 	ii->get_invariants(hw);
+@@ -7471,7 +7493,11 @@ static void ixgbe_watchdog_update_link(s
+ 	bool link_up = adapter->link_up;
+ 	bool pfc_en = adapter->dcb_cfg.pfc_mode_enable;
+ 
+-	if (!(adapter->flags & IXGBE_FLAG_NEED_LINK_UPDATE))
++	/* VEP1400 copper ports get no LSC interrupt for front-panel cable
++	 * changes behind the switch, so check the link on every watchdog run.
++	 */
++	if (!(adapter->flags & IXGBE_FLAG_NEED_LINK_UPDATE) &&
++	    !ixgbe_vep1400_copper(hw))
+ 		return;
+ 
+ 	if (hw->mac.ops.check_link) {
+@@ -8985,10 +9011,46 @@ static int ixgbe_mdio_write(struct net_d
+ 	return hw->phy.ops.write_reg(hw, addr, devad, value);
+ }
+ 
++/**
++ * ixgbe_vep1400_mii_ioctl - Clause 22 access to the VEP1400 switch
++ * @hw: pointer to hardware structure
++ * @mii: MII ioctl data
++ * @cmd: SIOCGMIIREG or SIOCSMIIREG
++ *
++ * The 88E6190 switch sits on the X553 MDIO bus shared by all functions and
++ * is managed by vep1400-mdio-tool at arbitrary Clause 22 PHY addresses.
++ **/
++static int ixgbe_vep1400_mii_ioctl(struct ixgbe_hw *hw,
++				   struct mii_ioctl_data *mii, int cmd)
++{
++	u32 gssr = hw->phy.phy_semaphore_mask | IXGBE_GSSR_TOKEN_SM |
++		   IXGBE_GSSR_PHY0_SM;
++	int val;
++
++	if (mii->phy_id >= PHY_MAX_ADDR || mii->reg_num > 0x1f)
++		return -EINVAL;
++
++	if (cmd == SIOCSMIIREG)
++		return ixgbe_mii_bus_write_generic_c22(hw, mii->phy_id,
++						       mii->reg_num, mii->val_in,
++						       gssr);
++
++	val = ixgbe_mii_bus_read_generic_c22(hw, mii->phy_id, mii->reg_num,
++					     gssr);
++	if (val < 0)
++		return val;
++	mii->val_out = val;
++	return 0;
++}
++
+ static int ixgbe_ioctl(struct net_device *netdev, struct ifreq *req, int cmd)
+ {
+ 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
+ 
++	if (ixgbe_vep1400_copper(&adapter->hw) &&
++	    (cmd == SIOCGMIIREG || cmd == SIOCSMIIREG))
++		return ixgbe_vep1400_mii_ioctl(&adapter->hw, if_mii(req), cmd);
++
+ 	switch (cmd) {
+ 	case SIOCSHWTSTAMP:
+ 		return ixgbe_ptp_set_ts_config(adapter, req);
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_phy.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_phy.c
+@@ -684,8 +684,8 @@ static int ixgbe_msca_cmd(struct ixgbe_h
+  *  @regnum: register number
+  *  @gssr: semaphore flags to acquire
+  **/
+-static int ixgbe_mii_bus_read_generic_c22(struct ixgbe_hw *hw, int addr,
+-					  int regnum, u32 gssr)
++int ixgbe_mii_bus_read_generic_c22(struct ixgbe_hw *hw, int addr,
++				   int regnum, u32 gssr)
+ {
+ 	u32 hwaddr, cmd;
+ 	int data;
+@@ -756,8 +756,8 @@ mii_bus_read_done:
+  *  @val: value to write
+  *  @gssr: semaphore flags to acquire
+  **/
+-static int ixgbe_mii_bus_write_generic_c22(struct ixgbe_hw *hw, int addr,
+-					   int regnum, u16 val, u32 gssr)
++int ixgbe_mii_bus_write_generic_c22(struct ixgbe_hw *hw, int addr,
++				    int regnum, u16 val, u32 gssr)
+ {
+ 	u32 hwaddr, cmd;
+ 	int err;
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_phy.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_phy.h
+@@ -176,4 +176,8 @@ int ixgbe_read_i2c_combined_generic_int(
+ 					u16 *val, bool lock);
+ int ixgbe_write_i2c_combined_generic_int(struct ixgbe_hw *, u8 addr, u16 reg,
+ 					 u16 val, bool lock);
++int ixgbe_mii_bus_read_generic_c22(struct ixgbe_hw *hw, int addr, int regnum,
++				   u32 gssr);
++int ixgbe_mii_bus_write_generic_c22(struct ixgbe_hw *hw, int addr, int regnum,
++				    u16 val, u32 gssr);
+ #endif /* _IXGBE_PHY_H_ */
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -3654,8 +3654,24 @@ struct ixgbe_hw {
+ 	bool				allow_unsupported_sfp;
+ 	bool				wol_enabled;
+ 	bool				need_crosstalk_fix;
++	/* Dell EMC VEP1400/EDGE610 X553 port, set once in ixgbe_sw_init() */
++	bool				vep1400;
+ };
+ 
++/* VEP1400 SFP cages are X553 KR_L ports with the SFP_N subsystem id */
++static inline bool ixgbe_vep1400_sfp(struct ixgbe_hw *hw)
++{
++	return hw->vep1400 &&
++	       hw->subsystem_device_id == IXGBE_DEV_ID_X550EM_A_SFP_N;
++}
++
++/* VEP1400 copper ports are the 2.5G SerDes uplinks to the 88E6190 switch */
++static inline bool ixgbe_vep1400_copper(struct ixgbe_hw *hw)
++{
++	return hw->vep1400 &&
++	       hw->subsystem_device_id != IXGBE_DEV_ID_X550EM_A_SFP_N;
++}
++
+ struct ixgbe_info {
+ 	enum ixgbe_mac_type		mac;
+ 	int				(*get_invariants)(struct ixgbe_hw *);
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_x550.c
+@@ -318,6 +318,12 @@ static int ixgbe_identify_phy_x550em(str
+ 	case IXGBE_DEV_ID_X550EM_X_KR:
+ 	case IXGBE_DEV_ID_X550EM_A_KR:
+ 	case IXGBE_DEV_ID_X550EM_A_KR_L:
++		/* VEP1400 SFP cages share the KR_L device id */
++		if (ixgbe_vep1400_sfp(hw)) {
++			hw->phy.phy_semaphore_mask = hw->bus.lan_id ?
++				IXGBE_GSSR_PHY1_SM : IXGBE_GSSR_PHY0_SM;
++			return ixgbe_identify_module_generic(hw);
++		}
+ 		hw->phy.type = ixgbe_phy_x550em_kr;
+ 		break;
+ 	case IXGBE_DEV_ID_X550EM_A_10G_T:
+@@ -1627,9 +1633,17 @@ static int ixgbe_supported_sfp_modules_X
+ 	case ixgbe_sfp_type_1g_lx_core1:
+ 		*linear = false;
+ 		break;
+-	case ixgbe_sfp_type_unknown:
+ 	case ixgbe_sfp_type_1g_cu_core0:
+ 	case ixgbe_sfp_type_1g_cu_core1:
++		/* VEP1400 cages run 1000BASE-KX autoneg, which copper SFPs
++		 * such as UF-RJ45-1G link up with
++		 */
++		if (ixgbe_vep1400_sfp(hw)) {
++			*linear = false;
++			break;
++		}
++		return -EOPNOTSUPP;
++	case ixgbe_sfp_type_unknown:
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -1782,6 +1796,34 @@ ixgbe_setup_mac_link_sfp_n(struct ixgbe_
+ }
+ 
+ /**
++ * ixgbe_setup_mac_link_sfp_vep1400 - Setup internal PHY for VEP1400 SFP
++ * @hw: pointer to hardware structure
++ * @speed: link speed
++ * @autoneg_wait_to_complete: unused
++ *
++ * The VEP1400 SFP cages hang off the X553 KR lanes without a CS4227; like
++ * the Dell factory driver, run KR/KX autoneg rather than forced SFI.
++ */
++static int
++ixgbe_setup_mac_link_sfp_vep1400(struct ixgbe_hw *hw, ixgbe_link_speed speed,
++				 __always_unused bool autoneg_wait_to_complete)
++{
++	bool setup_linear;
++	int ret_val;
++
++	ret_val = ixgbe_supported_sfp_modules_X550em(hw, &setup_linear);
++
++	/* SFP not present is not an error in the setup MAC link flow */
++	if (ret_val == -ENOENT)
++		return 0;
++
++	if (ret_val)
++		return ret_val;
++
++	return ixgbe_setup_kr_speed_x550em(hw, speed);
++}
++
++/**
+  * ixgbe_setup_mac_link_sfp_x550a - Setup internal PHY for SFP
+  * @hw: pointer to hardware structure
+  * @speed: link speed
+@@ -2168,6 +2210,52 @@ static void ixgbe_init_mac_link_ops_X550
+ 	}
+ }
+ 
++/* Marvell 88E6190 port status register on the VEP1400 MDIO bus */
++#define VEP1400_SW_PORT_STATUS	0x00
++#define VEP1400_SW_PORT_LINK	BIT(11)
++
++/**
++ * ixgbe_check_link_vep1400 - Determine VEP1400 copper link state
++ * @hw: pointer to hardware structure
++ * @speed: pointer to link speed
++ * @link_up: true when link is up
++ * @link_up_wait_to_complete: unused
++ *
++ * The port's SerDes to 88E6190 port 9 (LAN 0) or 10 (LAN 1) stays up
++ * regardless of cabling, so report link only while that uplink and at
++ * least one front-panel copper port (1-6) are up.
++ **/
++static int ixgbe_check_link_vep1400(struct ixgbe_hw *hw,
++				    ixgbe_link_speed *speed, bool *link_up,
++				    __always_unused bool link_up_wait_to_complete)
++{
++	u32 gssr = hw->phy.phy_semaphore_mask | IXGBE_GSSR_TOKEN_SM |
++		   IXGBE_GSSR_PHY0_SM;
++	int uplink = hw->bus.lan_id ? 0x0a : 0x09;
++	int port, val;
++
++	*link_up = false;
++	*speed = IXGBE_LINK_SPEED_UNKNOWN;
++
++	val = ixgbe_mii_bus_read_generic_c22(hw, uplink,
++					     VEP1400_SW_PORT_STATUS, gssr);
++	if (val < 0 || !(val & VEP1400_SW_PORT_LINK))
++		return 0;
++
++	for (port = 1; port <= 6; port++) {
++		val = ixgbe_mii_bus_read_generic_c22(hw, port,
++						     VEP1400_SW_PORT_STATUS,
++						     gssr);
++		if (val >= 0 && (val & VEP1400_SW_PORT_LINK)) {
++			*link_up = true;
++			*speed = IXGBE_LINK_SPEED_2_5GB_FULL;
++			break;
++		}
++	}
++
++	return 0;
++}
++
+ /** ixgbe_init_mac_link_ops_X550em - init mac link function pointers
+  *  @hw: pointer to hardware structure
+  **/
+@@ -2190,6 +2278,11 @@ static void ixgbe_init_mac_link_ops_X550
+ 		case IXGBE_DEV_ID_X550EM_A_SFP_N:
+ 			mac->ops.setup_mac_link = ixgbe_setup_mac_link_sfp_n;
+ 			break;
++		case IXGBE_DEV_ID_X550EM_A_KR_L:
++			/* VEP1400 SFP cages, see ixgbe_get_media_type_X550em() */
++			mac->ops.setup_mac_link =
++						ixgbe_setup_mac_link_sfp_vep1400;
++			break;
+ 		case IXGBE_DEV_ID_X550EM_A_SFP:
+ 			mac->ops.setup_mac_link =
+ 						ixgbe_setup_mac_link_sfp_x550a;
+@@ -2210,6 +2303,8 @@ static void ixgbe_init_mac_link_ops_X550
+ 		mac->ops.check_link = ixgbe_check_link_t_X550em;
+ 		break;
+ 	case ixgbe_media_type_backplane:
++		if (ixgbe_vep1400_copper(hw))
++			mac->ops.check_link = ixgbe_check_link_vep1400;
+ 		if (hw->device_id == IXGBE_DEV_ID_X550EM_A_SGMII ||
+ 		    hw->device_id == IXGBE_DEV_ID_X550EM_A_SGMII_L)
+ 			mac->ops.setup_link = ixgbe_setup_sgmii;
+@@ -2257,6 +2352,13 @@ static int ixgbe_get_link_capabilities_X
+ 		return 0;
+ 	}
+ 
++	/* VEP1400 SFP cages only run 1G KX autoneg */
++	if (ixgbe_vep1400_sfp(hw)) {
++		*speed = IXGBE_LINK_SPEED_1GB_FULL;
++		*autoneg = true;
++		return 0;
++	}
++
+ 	/* SFP */
+ 	if (hw->phy.media_type == ixgbe_media_type_fiber) {
+ 		/* CS4227 SFP must not enable auto-negotiation */
+@@ -2300,7 +2402,12 @@ static int ixgbe_get_link_capabilities_X
+ 					break;
+ 				} else if (hw->device_id ==
+ 					   IXGBE_DEV_ID_X550EM_A_KR_L) {
+-					*speed = IXGBE_LINK_SPEED_1GB_FULL;
++					/* VEP1400 uplinks run fixed 2.5G */
++					if (ixgbe_vep1400_copper(hw))
++						*speed = IXGBE_LINK_SPEED_2_5GB_FULL |
++							 IXGBE_LINK_SPEED_1GB_FULL;
++					else
++						*speed = IXGBE_LINK_SPEED_1GB_FULL;
+ 					break;
+ 				}
+ 			}
+@@ -2550,8 +2657,14 @@ static int ixgbe_setup_kr_speed_x550em(s
+ 		reg_val |= IXGBE_KRM_LINK_CTRL_1_TETH_AN_CAP_KR;
+ 
+ 	/* Advertise 1G support. */
+-	if (speed & IXGBE_LINK_SPEED_1GB_FULL)
++	if (speed & IXGBE_LINK_SPEED_1GB_FULL) {
+ 		reg_val |= IXGBE_KRM_LINK_CTRL_1_TETH_AN_CAP_KX;
++		/* VEP1400 copper SFPs only link up with SGMII autoneg */
++		if (ixgbe_vep1400_sfp(hw) &&
++		    (hw->phy.sfp_type == ixgbe_sfp_type_1g_cu_core0 ||
++		     hw->phy.sfp_type == ixgbe_sfp_type_1g_cu_core1))
++			reg_val |= IXGBE_KRM_LINK_CTRL_1_TETH_AN_SGMII_EN;
++	}
+ 
+ 	status = hw->mac.ops.write_iosf_sb_reg(hw,
+ 					IXGBE_KRM_LINK_CTRL_1(hw->bus.lan_id),
+@@ -2567,8 +2680,14 @@ static int ixgbe_setup_kr_speed_x550em(s
+ 			return status;
+ 
+ 		reg_val &= ~IXGBE_KRM_PMD_FLX_MASK_ST20_SPEED_MASK;
+-		reg_val |= IXGBE_KRM_PMD_FLX_MASK_ST20_SPEED_AN;
+-		reg_val |= IXGBE_KRM_PMD_FLX_MASK_ST20_AN_EN;
++		if (ixgbe_vep1400_copper(hw)) {
++			/* 88E6190 SerDes ports 9/10 run fixed 2.5G */
++			reg_val |= IXGBE_KRM_PMD_FLX_MASK_ST20_SPEED_2_5G;
++			reg_val &= ~IXGBE_KRM_PMD_FLX_MASK_ST20_AN_EN;
++		} else {
++			reg_val |= IXGBE_KRM_PMD_FLX_MASK_ST20_SPEED_AN;
++			reg_val |= IXGBE_KRM_PMD_FLX_MASK_ST20_AN_EN;
++		}
+ 		reg_val &= ~IXGBE_KRM_PMD_FLX_MASK_ST20_AN37_EN;
+ 		reg_val &= ~IXGBE_KRM_PMD_FLX_MASK_ST20_SGMII_EN;
+ 
+@@ -2586,8 +2705,11 @@ static int ixgbe_setup_kr_speed_x550em(s
+  **/
+ static int ixgbe_setup_kr_x550em(struct ixgbe_hw *hw)
+ {
+-	/* leave link alone for 2.5G */
+-	if (hw->phy.autoneg_advertised & IXGBE_LINK_SPEED_2_5GB_FULL)
++	/* leave link alone for 2.5G, except VEP1400 which needs its fixed
++	 * 2.5G lane mode programmed
++	 */
++	if (!ixgbe_vep1400_copper(hw) &&
++	    (hw->phy.autoneg_advertised & IXGBE_LINK_SPEED_2_5GB_FULL))
+ 		return 0;
+ 
+ 	if (ixgbe_check_reset_blocked(hw))
+@@ -3198,7 +3320,11 @@ static int ixgbe_init_phy_ops_X550em(str
+ 
+ 	ixgbe_read_mng_if_sel_x550em(hw);
+ 
+-	if (hw->mac.ops.get_media_type(hw) == ixgbe_media_type_fiber) {
++	/* VEP1400 SFP cages have no CS4227 mux, ixgbe_identify_phy_x550em()
++	 * picks their semaphore
++	 */
++	if (hw->mac.ops.get_media_type(hw) == ixgbe_media_type_fiber &&
++	    !ixgbe_vep1400_sfp(hw)) {
+ 		phy->phy_semaphore_mask = IXGBE_GSSR_SHARED_I2C_SM;
+ 		ixgbe_setup_mux_ctl(hw);
+ 	}
+@@ -3293,7 +3419,11 @@ static enum ixgbe_media_type ixgbe_get_m
+ 	case IXGBE_DEV_ID_X550EM_X_XFI:
+ 	case IXGBE_DEV_ID_X550EM_A_KR:
+ 	case IXGBE_DEV_ID_X550EM_A_KR_L:
+-		media_type = ixgbe_media_type_backplane;
++		/* VEP1400 SFP cages share the KR_L device id */
++		if (ixgbe_vep1400_sfp(hw))
++			media_type = ixgbe_media_type_fiber;
++		else
++			media_type = ixgbe_media_type_backplane;
+ 		break;
+ 	case IXGBE_DEV_ID_X550EM_X_SFP:
+ 	case IXGBE_DEV_ID_X550EM_A_SFP:

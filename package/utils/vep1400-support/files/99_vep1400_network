@@ -1,0 +1,30 @@
+#!/bin/sh
+# Default network configuration for Dell EMC VEP1400 / Edge 610
+
+case "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" in
+EDGE6*|VEP14*) ;;
+*) exit 0 ;;
+esac
+
+# Check if network config exists
+uci -q get network.lan >/dev/null || exit 0
+
+# Primary switch uplink (Port 9 / GE1~GE6) is assigned to LAN by default
+# Find the primary copper interface
+copper_if=""
+for n in /sys/class/net/*; do
+	dev=$n/device
+	[ -e "$dev/driver" ] || continue
+	[ "$(basename "$(readlink -f "$dev/driver")")" = ixgbe ] || continue
+	[ "$(cat "$dev/device")" = "0x15c3" ] || continue
+	[ "$(cat "$dev/subsystem_device")" != "0x15c4" ] || continue
+	copper_if="$(basename "$n")"
+	break
+done
+
+if [ -n "$copper_if" ]; then
+	uci set network.lan.device="$copper_if"
+	uci commit network
+fi
+
+exit 0

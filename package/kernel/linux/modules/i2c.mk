@@ -239,6 +239,23 @@ endef
 $(eval $(call KernelPackage,i2c-mlxcpld))
 
 
+I2C_ISMT_MODULES:= \
+  CONFIG_I2C_ISMT:drivers/i2c/busses/i2c-ismt
+
+define KernelPackage/i2c-ismt
+  $(call i2c_defaults,$(I2C_ISMT_MODULES),59)
+  TITLE:=Intel iSMT SMBus driver
+  DEPENDS:=@PCI_SUPPORT @TARGET_x86 +kmod-i2c-core
+endef
+
+define KernelPackage/i2c-ismt/description
+ This driver provides support for the Intel SMBus Message Transport (iSMT)
+ controller found on Intel Atom C2000 and C3000 series processors.
+endef
+
+$(eval $(call KernelPackage,i2c-ismt))
+
+
 I2C_MUX_MODULES:= \
   CONFIG_I2C_MUX:drivers/i2c/i2c-mux
 

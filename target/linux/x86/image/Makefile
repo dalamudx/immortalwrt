@@ -12,7 +12,7 @@ GRUB_TERMINAL_CONFIG =
 GRUB_CONSOLE_CMDLINE =
 
 ifneq ($(CONFIG_GRUB_CONSOLE),)
-  GRUB_CONSOLE_CMDLINE += console=tty1
+  GRUB_CONSOLE_CMDLINE += console=tty0
   GRUB_TERMINALS += console
 endif
 
@@ -33,6 +33,7 @@ GRUB_TIMEOUT:=$(call qstrip,$(CONFIG_GRUB_TIMEOUT))
 GRUB_TITLE:=$(call qstrip,$(CONFIG_GRUB_TITLE))
 
 BOOTOPTS:=$(call qstrip,$(CONFIG_GRUB_BOOTOPTS))
+BOOTOPTS:=$(if $(BOOTOPTS),$(BOOTOPTS),quiet)
 
 define Build/combined
 	$(CP) $(KDIR)/$(KERNEL_NAME) $@.boot/boot/vmlinuz

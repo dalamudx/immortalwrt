@@ -1,0 +1,129 @@
+#!/bin/sh
+# VEP1400 board bring-up: Marvell 88E6190 switch, SerDes and SFP TX power.
+# Interface names and CPLD I2C bus are discovered at runtime, never hardcoded.
+
+MDIO=/usr/sbin/vep1400-mdio-tool
+X553_DEV=0x15c3          # Intel X553 backplane (both copper and SFP domains)
+X553_SFP_SUBDEV=0x15c4   # Subsystem ID marking SFP-domain ports
+CPLD_ADDR=0x31
+ERRORS=0
+
+log() {
+	echo "VEP1400: $*" > /dev/kmsg 2>/dev/null || logger -t VEP1400 "$*"
+}
+
+# Print "<pci-addr> <ifname> <subsystem_device>" for every ixgbe X553 port, sorted by PCI address
+list_x553() {
+	local dev n
+	for n in /sys/class/net/*; do
+		dev=$n/device
+		[ -e "$dev/driver" ] || continue
+		[ "$(basename "$(readlink -f "$dev/driver")")" = ixgbe ] || continue
+		[ "$(cat "$dev/device")" = "$X553_DEV" ] || continue
+		echo "$(basename "$(readlink -f "$dev")") $(basename "$n") $(cat "$dev/subsystem_device")"
+	done | sort
+}
+
+# The switch is managed through the copper-domain port that answers with the 88E6190 switch id
+find_switch_iface() {
+	local id ifname pci subdev
+	while read -r pci ifname subdev; do
+		[ "$subdev" = "$X553_SFP_SUBDEV" ] && continue
+		id=$($MDIO "$ifname" r mac 0x0 0x3 2>/dev/null | tail -n 1)
+		case "$id" in
+		0x190*) echo "$ifname"; return 0 ;;
+		esac
+	done <<EOF
+$(list_x553)
+EOF
+	return 1
+}
+
+mdio_w() {
+	$MDIO "$IFACE" w "$@" quiet || { log "mdio write failed: $*"; ERRORS=$((ERRORS + 1)); }
+}
+
+# Prefer the iSMT adapter, then probe the rest read-only
+find_cpld_bus() {
+	local b
+	for b in $(grep -l iSMT /sys/bus/i2c/devices/i2c-*/name 2>/dev/null) \
+	         $(grep -L iSMT /sys/bus/i2c/devices/i2c-*/name 2>/dev/null); do
+		b=${b%/name}; b=${b##*/i2c-}
+		i2cget -y "$b" $CPLD_ADDR 0x0 >/dev/null 2>&1 && { echo "$b"; return 0; }
+	done
+	return 1
+}
+
+# 1. Wait for interfaces to settle and find the switch management interface
+IFACE=""
+for _ in $(seq 1 30); do
+	IFACE=$(find_switch_iface) && break
+	sleep 1
+done
+if [ -z "$IFACE" ]; then
+	log "88E6190 switch management port not found, skipping bring-up"
+	exit 0
+fi
+log "initializing 88E6190 switch via $IFACE..."
+
+# 2. 88E6190 LED init
+for p in 1 2 3 4 5 6; do
+	mdio_w mac 0x$p 0x16 0x8030
+done
+
+# 3. 88E6190 internal PHY init
+for p in 1 2 3 4 5 6; do
+	mdio_w int 0x$p 0x08 0xf8 0x0036
+	mdio_w int 0x$p 0x14 0x00 0x8020
+done
+
+# 4. Board-type polarity and SFP TX power (CPLD)
+if CPLD_BUS=$(find_cpld_bus); then
+	boardid=$(i2cget -y "$CPLD_BUS" $CPLD_ADDR 0x0)
+	boardtype=$(( boardid & 0x0f ))
+	log "CPLD on i2c-$CPLD_BUS, board id $boardid, board type $boardtype"
+	case $boardtype in
+	4|5|6)
+		mdio_w int 0x1 0x14 0x0 0x8023
+		mdio_w int 0x2 0x14 0x0 0x802a
+		mdio_w int 0x3 0x14 0x0 0x8026
+		mdio_w int 0x4 0x14 0x0 0x802a
+		mdio_w int 0x5 0x14 0x0 0x8024
+		mdio_w int 0x6 0x14 0x0 0x802a
+		;;
+	esac
+	i2cset -y "$CPLD_BUS" $CPLD_ADDR 0x10 0x00 b || ERRORS=$((ERRORS + 1))
+	i2cset -y "$CPLD_BUS" $CPLD_ADDR 0x11 0x00 b || ERRORS=$((ERRORS + 1))
+else
+	log "CPLD not found, SFP TX power left untouched"
+fi
+
+# 5. Internal PHY and SerDes power up
+for p in 1 2 3 4 5 6; do
+	mdio_w int 0x$p 0x0 0x0 0x1140
+done
+mdio_w ser 0x9 0x2000 0x4 0x0140
+mdio_w ser 0xa 0x2000 0x4 0x0140
+
+# 6. Port forwarding enable
+mdio_w mac 0x0 0x4 0x007c
+for p in 1 2 3 4 5 6; do
+	mdio_w mac 0x$p 0x4 0x007f
+done
+mdio_w mac 0x9 0x4 0x007f
+mdio_w mac 0x9 0x1 0x003b
+mdio_w mac 0xa 0x4 0x007f
+
+# 7. Bring up every X553 port
+while read -r pci ifname subdev; do
+	ip link set "$ifname" up 2>/dev/null || true
+done <<EOF
+$(list_x553)
+EOF
+
+if [ "$ERRORS" -ne 0 ]; then
+	log "Switch and SerDes bring-up completed with $ERRORS errors."
+	exit 1
+fi
+log "Switch and SerDes bring-up completed successfully."
+exit 0
