@@ -11,7 +11,8 @@ define Package/vep1400-support
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Dell EMC VEP1400 / Edge 610 board bring-up and MDIO tool
-  DEPENDS:=@TARGET_x86 +kmod-ixgbe +i2c-tools +kmod-i2c-ismt +kmod-i2c-core
+  DEPENDS:=@TARGET_x86 +kmod-ixgbe +i2c-tools +kmod-i2c-ismt +kmod-i2c-core \
+           +kmod-ath10k +ath10k-firmware-qca988x +wpad-basic-mbedtls
 endef
 
 define Package/vep1400-support/description
