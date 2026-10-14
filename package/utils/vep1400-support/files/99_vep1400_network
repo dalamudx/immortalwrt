@@ -10,7 +10,6 @@ esac
 uci -q get network.lan >/dev/null || exit 0
 
 # Primary switch uplink (Port 9 / GE1~GE6) is assigned to LAN by default
-# Find the primary copper interface
 copper_if=""
 for n in /sys/class/net/*; do
 	dev=$n/device
@@ -24,7 +23,16 @@ done
 
 if [ -n "$copper_if" ]; then
 	uci set network.lan.device="$copper_if"
+	uci set network.lan.ipaddr='10.10.30.174'
+	uci set network.lan.netmask='255.255.255.0'
+	uci set network.lan.gateway='10.10.30.1'
+	uci add_list network.lan.dns='10.10.30.1'
+	uci add_list network.lan.ipaddr='192.168.1.1/24'
 	uci commit network
 fi
 
+# Mask remote kernel / kmod repository to prevent accidental kernel overwrite
+if [ -f /etc/apk/repositories.d/distfeeds.list ]; then
+	sed -i 's|^https://.*targets/x86/64/packages.*|# &|' /etc/apk/repositories.d/distfeeds.list
+fi
 exit 0
