@@ -126,3 +126,14 @@ running kernel configuration, patches and package ABI hash; matching
 `uname -r` alone is insufficient. Do not use `--force`, `--no-deps`,
 `--allow-untrusted` or a public kmod feed to bypass the kernel
 requirement (`--allow-untrusted` only skips package signature checks).
+
+If the full image was already installed via sysupgrade and the extra
+`/dev/mmcblk0p3` persistent overlay was preserved, the active
+kernel (`/boot/vmlinuz`) and squashfs `/rom` now contain the new
+kernel, mihomo, FRR and the three kmods. However, the preserved
+`/overlay/upper/lib/apk/db/installed` and `/overlay/upper/etc/apk/world`
+shadow the new ROM database, leaving the package manager recording the
+older kernel identity and missing the new built-in packages. To reconcile
+the database without losing previously installed packages (like AdGuardHome
+or smartdns), merge the new ROM entries into the overlay database or
+update the pinned kernel entry before adding new package constraints.
