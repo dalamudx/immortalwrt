@@ -97,3 +97,32 @@ This example is **not installed or enabled** in the image. The packaged
 `bgpd=no` must be changed only after the route policy is verified and
 TUN/proxy availability is monitored. Start with a handful of prefixes,
 then test load and failure recovery on the RB5009 before full import.
+
+## Installing on an existing VEP1400 image
+
+The device can report the same `uname -r` as this build but have a
+*different kernel package identity*. Compare `apk list -I | grep '^kernel-'`
+on the device with the `kernel - ...` entry in the new image manifest.
+For example, the deployed image reports
+`6.12.103~f355b4816a3cabe6b588ed985e5cc486-r1`, while this image
+reports `6.12.103~577e39d324d0cfe917fb3cfcc73fb987-r1`.
+These are different module ABIs; the new `kmod-tun`, `kmod-netlink-diag`
+and `kmod-inet-diag` APKs cannot safely be installed on the older image.
+The target kmod repository is intentionally disabled on deployed units
+to prevent installing unpatched stock ixgbe/kernel packages.
+
+Install the **complete new firmware** containing mihomo, FRR and matching
+modules after making and verifying an off-device backup of network, DNS,
+web proxy, credentials and `/overlay` data. Check the partition layout
+and restoration procedure before flashing: this unit uses an extra F2FS
+`/dev/mmcblk0p3` as `/overlay`; do not assume `sysupgrade` preserves that
+custom partition or every package/data file. The old `/etc/apk/world`
+also pins the old kernel identity, so verify or update that pin when
+restoring package selections. Recheck `apk list -I`, `df -h`, management
+SSH and DNS after reboot before configuring proxy/routing.
+
+An alternative is to rebuild the three kmods against the *exact*
+running kernel configuration, patches and package ABI hash; matching
+`uname -r` alone is insufficient. Do not use `--force`, `--no-deps`,
+`--allow-untrusted` or a public kmod feed to bypass the kernel
+requirement (`--allow-untrusted` only skips package signature checks).
