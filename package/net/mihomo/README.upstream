@@ -1,0 +1,8 @@
+Package based on https://github.com/douglarek/mihomo-openwrt
+Pinned package revision: 68f9c94de324588ee6b1b15d120d0927cea78b45
+Upstream packaging license: MIT (Leo Douglas, 2024; see upstream LICENSE).
+Package Makefile SPDX: GPL-2.0-only as supplied by upstream.
+Program source: MetaCubeX/mihomo tag v1.19.32; GPL-3.0-only.
+The mutable 'stable' source and PKG_HASH=skip were replaced with a fixed tag
+and SHA-256 to keep the firmware source verifiable. The init script is disabled
+until /etc/config/mihomo and /etc/mihomo/config.yaml are configured.
